@@ -8,7 +8,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Parse PowerShell scripts
         shell: powershell
@@ -82,9 +82,8 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Check shell syntax
         run: |
           sh -n install.sh
           sh -n uninstall.sh
-
