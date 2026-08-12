@@ -5,7 +5,6 @@ if (-not $IsWindows -and $PSVersionTable.PSEdition -eq "Core") {
 }
 
 $CodexApiHome = if ($env:CODEX_API_HOME) { $env:CODEX_API_HOME } else { Join-Path $HOME ".codex-api" }
-$BinDir = if ($env:CODEX_API_BIN_DIR) { $env:CODEX_API_BIN_DIR } else { Join-Path $HOME ".local\bin" }
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Read-Required([string]$Prompt) {
@@ -24,6 +23,13 @@ if (-not (Get-Command codex -ErrorAction SilentlyContinue)) {
 }
 
 codex --version
+$CodexCommand = Get-Command codex -ErrorAction Stop
+$CodexPath = $CodexCommand.Source
+if ([string]::IsNullOrWhiteSpace($CodexPath)) { $CodexPath = $CodexCommand.Path }
+if ([string]::IsNullOrWhiteSpace($CodexPath)) {
+    throw "Could not determine where the codex command is installed."
+}
+$BinDir = if ($env:CODEX_API_BIN_DIR) { $env:CODEX_API_BIN_DIR } else { Split-Path -Parent $CodexPath }
 
 $BaseUrl = Read-Required "API Base URL (must support the Responses API)"
 $Model = Read-Required "Model ID"
@@ -32,10 +38,9 @@ if ([string]::IsNullOrWhiteSpace($Reasoning)) { $Reasoning = "high" }
 if ($Reasoning -notin @("minimal", "low", "medium", "high", "xhigh")) {
     throw "Reasoning effort must be minimal, low, medium, high, or xhigh."
 }
-$SecureKey = Read-Host "API Key (encrypted for your Windows account)" -AsSecureString
-$keyCheck = [pscredential]::new("codex-api", $SecureKey).GetNetworkCredential().Password
-if ([string]::IsNullOrEmpty($keyCheck)) { throw "API Key cannot be empty." }
-$keyCheck = $null
+Write-Warning "The API Key will be stored as plain text in $CodexApiHome\config.toml. Do not share or upload that file."
+$ApiKey = Read-Required "API Key"
+if ($ApiKey.Contains("`r") -or $ApiKey.Contains("`n")) { throw "API Key cannot contain a line break." }
 
 if (Test-Path $CodexApiHome) {
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -45,7 +50,7 @@ if (Test-Path $CodexApiHome) {
     Write-Host "Existing API-mode configuration backed up to $backup"
 }
 
-New-Item -ItemType Directory -Force -Path $CodexApiHome, $BinDir | Out-Null
+New-Item -ItemType Directory -Force -Path $CodexApiHome | Out-Null
 
 function Escape-Toml([string]$Value) {
     return $Value.Replace('\', '\\').Replace('"', '\"')
@@ -66,7 +71,7 @@ approval_policy = "on-request"
 [model_providers.custom]
 name = "Custom OpenAI-compatible provider"
 base_url = "$(Escape-Toml $BaseUrl)"
-env_key = "CODEX_API_KEY"
+experimental_bearer_token = "$(Escape-Toml $ApiKey)"
 wire_api = "responses"
 requires_openai_auth = false
 
@@ -79,27 +84,27 @@ sandbox = "elevated"
 
 Write-Utf8NoBom (Join-Path $CodexApiHome "config.toml") $config
 Copy-Item -Force (Join-Path $ScriptDir "AGENTS.md") (Join-Path $CodexApiHome "AGENTS.md")
-$SecureKey | ConvertFrom-SecureString | Set-Content -Encoding ascii (Join-Path $CodexApiHome "api-key.dpapi")
+$ApiKey = $null
 
-$launcher = @'
-$ErrorActionPreference = "Stop"
-$env:CODEX_HOME = if ($env:CODEX_API_HOME) { $env:CODEX_API_HOME } else { Join-Path $HOME ".codex-api" }
-$encrypted = Get-Content -Raw (Join-Path $env:CODEX_HOME "api-key.dpapi")
-$secure = ConvertTo-SecureString $encrypted
-$credential = [pscredential]::new("codex-api", $secure)
-$env:CODEX_API_KEY = $credential.GetNetworkCredential().Password
-& codex @args
-exit $LASTEXITCODE
-'@
-Write-Utf8NoBom (Join-Path $BinDir "codex-api.ps1") $launcher
-Set-Content -Encoding ascii -Path (Join-Path $BinDir "codex-api.cmd") -Value '@powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0codex-api.ps1" %*'
+$launcher = @"
+@echo off
+setlocal
+set "CODEX_HOME=$CodexApiHome"
+call codex %*
+exit /b %ERRORLEVEL%
+"@
+$LauncherPath = Join-Path $BinDir "codex-api.cmd"
+Set-Content -Encoding ascii -Path $LauncherPath -Value $launcher
 
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-$pathEntries = @($userPath -split ';' | Where-Object { $_ })
-if ($BinDir -notin $pathEntries) {
-    $newPath = (@($pathEntries) + $BinDir) -join ';'
-    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-    $env:Path = "$BinDir;$env:Path"
+# Remove files created by versions that used the unreliable DPAPI/PowerShell launcher.
+Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $CodexApiHome "api-key.dpapi")
+Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $BinDir "codex-api.ps1")
+if (-not $env:CODEX_API_BIN_DIR) {
+    $OldBinDir = Join-Path $HOME ".local\bin"
+    if ($OldBinDir -ne $BinDir) {
+        Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $OldBinDir "codex-api.cmd")
+        Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $OldBinDir "codex-api.ps1")
+    }
 }
 
 $oldHome = $env:CODEX_HOME
@@ -110,6 +115,9 @@ try {
     $env:CODEX_HOME = $oldHome
 }
 
+& $LauncherPath --version
+
 Write-Host "`nSetup complete."
 Write-Host "Account mode: codex"
 Write-Host "API mode:     codex-api"
+Write-Host "Launcher:     $LauncherPath"

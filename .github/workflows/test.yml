@@ -1,0 +1,90 @@
+name: Test installers
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse PowerShell scripts
+        shell: powershell
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\install.ps1),
+            [ref]$null,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count) { throw ($errors | Out-String) }
+
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\uninstall.ps1),
+            [ref]$null,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count) { throw ($errors | Out-String) }
+
+      - name: Exercise Windows install and launcher
+        shell: powershell
+        run: |
+          $testRoot = Join-Path $env:RUNNER_TEMP "codex-api-setup"
+          $fakeBin = Join-Path $testRoot "bin"
+          $apiHome = Join-Path $testRoot ".codex-api"
+          New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null
+
+          @'
+          @echo off
+          if "%1"=="--version" (
+            echo codex-cli test
+            exit /b 0
+          )
+          if "%1"=="features" (
+            if not exist "%CODEX_HOME%\config.toml" exit /b 1
+            exit /b 0
+          )
+          echo HOME=%CODEX_HOME% ARGS=%*
+          '@ | Set-Content -Encoding ascii (Join-Path $fakeBin "codex.cmd")
+
+          $env:PATH = "$fakeBin;$env:PATH"
+          $env:CODEX_API_HOME = $apiHome
+          $inputLines = @(
+            "https://example.test/v1",
+            "test-model",
+            "high",
+            "test-secret-key"
+          ) -join "`r`n"
+          $inputLines | powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed: $LASTEXITCODE" }
+
+          $config = Get-Content -Raw (Join-Path $apiHome "config.toml")
+          if ($config -notmatch 'base_url = "https://example\.test/v1"') { throw "Base URL missing" }
+          if ($config -notmatch 'model = "test-model"') { throw "Model missing" }
+          if ($config -notmatch 'experimental_bearer_token = "test-secret-key"') { throw "API key missing" }
+          if (Test-Path (Join-Path $apiHome "api-key.dpapi")) { throw "Legacy DPAPI file still exists" }
+
+          $launcher = Join-Path $fakeBin "codex-api.cmd"
+          if (-not (Test-Path $launcher)) { throw "codex-api.cmd was not installed beside codex" }
+          & $launcher smoke-test | Tee-Object -Variable launchOutput
+          if ($LASTEXITCODE -ne 0) { throw "codex-api.cmd failed: $LASTEXITCODE" }
+          if (($launchOutput | Out-String) -notmatch [regex]::Escape("HOME=$apiHome ARGS=smoke-test")) {
+            throw "Launcher did not use the isolated CODEX_HOME"
+          }
+
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
+          if ($LASTEXITCODE -ne 0) { throw "uninstall.ps1 failed: $LASTEXITCODE" }
+          if (Test-Path $launcher) { throw "Launcher was not removed" }
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: |
+          sh -n install.sh
+          sh -n uninstall.sh
+
